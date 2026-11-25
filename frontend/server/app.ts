@@ -60,7 +60,10 @@ function getRegisterHandler(app: Application, basePath: string) {
     handler: express.Handler,
   ) => {
     func.call(app, route, handler);
-    return func.call(app, `${basePath}${route}`, handler);
+    const prefixedRoutes = Array.isArray(route)
+      ? route.map((entry) => `${basePath}${entry}`)
+      : `${basePath}${route}`;
+    return func.call(app, prefixedRoutes, handler);
   };
 }
 
@@ -289,6 +292,16 @@ function createUIServer(options: UIConfigs) {
     app.all(
       '/k8s/pod/logs',
       hardenPodLogsProxyRequest,
+      (req, res, next) => {
+        for (const key of ['runid', 'podname']) {
+          const value = req.query[key];
+          if (typeof value !== 'string' || !value || value === '.' || value === '..') {
+            res.status(400).send(`${key} must be a non-empty path segment`);
+            return;
+          }
+        }
+        next();
+      },
       createProxyMiddleware({
         changeOrigin: true,
         on: {
@@ -300,45 +313,9 @@ function createUIServer(options: UIConfigs) {
         headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
         pathRewrite: (pathStr: string, req: any) => {
           /** Argo nodeId is just POD name */
-          const nodeId = req.query.podname;
-          const runId = req.query.runid;
+          const nodeId = encodeURIComponent(req.query.podname as string);
+          const runId = encodeURIComponent(req.query.runid as string);
           return `/${apiVersion1Prefix}/runs/${runId}/nodes/${nodeId}/log`;
-        },
-        target: apiServerAddress,
-      }),
-    );
-  } else {
-    registerHandler(
-      app.get,
-      '/k8s/pod/logs',
-      getPodLogsHandler(
-        options.argo,
-        options.artifacts,
-        options.pod.logContainerName,
-        authorizeFn,
-        options.auth.enabled,
-      ),
-    );
-  }
-
-  if (options.artifacts.streamLogsFromServerApi) {
-    app.all(
-      '/k8s/pod/logs',
-      hardenPodLogsProxyRequest,
-      createProxyMiddleware({
-        changeOrigin: true,
-        on: {
-          proxyReq: (proxyReq) => {
-            console.log('Proxied log request: ', proxyReq.path);
-          },
-          proxyRes: hardenPodLogsProxyResponse,
-        },
-        headers: HACK_FIX_HPM_PARTIAL_RESPONSE_HEADERS,
-        pathRewrite: (pathStr: string, req: any) => {
-          /** Argo nodeId is just POD name */
-          const nodeId = req.query.podname;
-          const runId = req.query.runid;
-          return `/${apiVersion2Prefix}/runs/${runId}/nodes/${nodeId}/log`;
         },
         target: apiServerAddress,
       }),

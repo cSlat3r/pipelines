@@ -629,6 +629,96 @@ describe('UIServer apis', () => {
       expect(response.headers['content-type']).toBe('text/plain; charset=utf-8');
     });
 
+    it.each([
+      ['runid=run%2Fid&podname=pod%3Fname', '/apis/v1beta1/runs/run%2Fid/nodes/pod%3Fname/log'],
+      [
+        'runid=r1%3AreportMetrics%3F&podname=pod',
+        '/apis/v1beta1/runs/r1%3AreportMetrics%3F/nodes/pod/log',
+      ],
+    ])(
+      'proxies %s as encoded log path segments and preserves identity',
+      async (query, expectedPath) => {
+        const upstreamRequests: Array<{
+          method: string;
+          path: string;
+          user: string | string[] | undefined;
+        }> = [];
+        kfpApiServer = express()
+          .all('/*', (req, res) => {
+            upstreamRequests.push({
+              method: req.method,
+              path: req.originalUrl,
+              user: req.headers['kubeflow-userid'],
+            });
+            res.status(200).type('text/html').send('upstream response');
+          })
+          .listen(0);
+        await waitForListening(kfpApiServer);
+        const address = kfpApiServer.address();
+        if (!address || typeof address === 'string') {
+          throw new Error('Expected mock API server to bind to a TCP port');
+        }
+        app = new UIServer(
+          loadConfigs(argv, {
+            ML_PIPELINE_SERVICE_HOST: 'localhost',
+            ML_PIPELINE_SERVICE_PORT: `${address.port}`,
+            STREAM_LOGS_FROM_SERVER_API: 'true',
+          }),
+        );
+        const router = (app.app as any)._router || (app.app as any).router;
+        expect(
+          router.stack.filter((layer: any) => layer.route?.path === '/k8s/pod/logs'),
+        ).toHaveLength(1);
+
+        const response = await requests(app.app)
+          .post(`/k8s/pod/logs?${query}`)
+          .set('kubeflow-userid', 'user@example.com')
+          .expect(200);
+
+        expect(upstreamRequests).toEqual([
+          { method: 'POST', path: expectedPath, user: 'user@example.com' },
+        ]);
+        expect(response.text).toBe('upstream response');
+        expect(response.headers['content-type']).toBe('text/plain; charset=utf-8');
+        expect(response.headers['content-disposition']).toBe('attachment');
+        expect(response.headers['x-content-type-options']).toBe('nosniff');
+      },
+    );
+
+    it.each([
+      'podname=pod',
+      'runid=run',
+      'runid=&podname=pod',
+      'runid=..&podname=pod',
+      'runid=run&podname=.',
+      'runid=a&runid=b&podname=pod',
+    ])('rejects invalid proxy path parameters without proxying: %s', async (query) => {
+      let upstreamRequests = 0;
+      kfpApiServer = express()
+        .all('/*', (_, res) => {
+          upstreamRequests++;
+          res.status(200).send('upstream response');
+        })
+        .listen(0);
+      await waitForListening(kfpApiServer);
+      const address = kfpApiServer.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('Expected mock API server to bind to a TCP port');
+      }
+      app = new UIServer(
+        loadConfigs(argv, {
+          ML_PIPELINE_SERVICE_HOST: 'localhost',
+          ML_PIPELINE_SERVICE_PORT: `${address.port}`,
+          STREAM_LOGS_FROM_SERVER_API: 'true',
+        }),
+      );
+
+      const response = await requests(app.app).get(`/k8s/pod/logs?${query}`).expect(400);
+
+      expect(response.headers['x-content-type-options']).toBe('nosniff');
+      expect(upstreamRequests).toBe(0);
+    });
+
     it('hardens proxy errors produced before an upstream response exists', async () => {
       const unavailableServer = express().listen(0);
       await waitForListening(unavailableServer);
@@ -699,11 +789,14 @@ describe('UIServer apis', () => {
   describe('/apis/v1beta1/', () => {
     let request: requests.SuperTest<requests.Test>;
     let kfpApiServer: Server;
+    let upstreamRequests: string[];
 
     beforeEach(() => {
       const kfpApiPort = 3001;
+      upstreamRequests = [];
       kfpApiServer = express()
-        .all('/*', (_, res) => {
+        .all('/*', (req, res) => {
+          upstreamRequests.push(`${req.method} ${req.originalUrl}`);
           res.status(200).send('KFP API is working');
         })
         .listen(kfpApiPort);
@@ -762,6 +855,29 @@ describe('UIServer apis', () => {
       await request
         .post(`/apis/v1beta1/runs/a-random-run-id:archive`)
         .expect(200, 'KFP API is working');
+    });
+
+    describe.each(['', '/pipeline'])('with base path "%s"', (prefix) => {
+      it.each([
+        '/apis/v1beta1/runs/a-random-run-id:reportMetrics',
+        '/apis/v1beta1/workflows/a-random-workflow-id',
+        '/apis/v1beta1/scheduledworkflows/a-random-swf-id',
+        '/apis/v2beta1/workflows/a-random-workflow-id',
+        '/apis/v2beta1/scheduledworkflows/a-random-swf-id',
+      ])('rejects internal api %s without proxying', async (path) => {
+        await request
+          .post(`${prefix}${path}`)
+          .expect(403, `${prefix}${path} endpoint is not meant for external usage.`);
+        expect(upstreamRequests).toEqual([]);
+      });
+
+      it.each([
+        '/apis/v1beta1/runs/xxx-reportMetrics:archive',
+        '/apis/v1beta1/runs/a-random-run-id:archive',
+      ])('proxies public api %s', async (path) => {
+        await request.post(`${prefix}${path}`).expect(200, 'KFP API is working');
+        expect(upstreamRequests).toEqual([`POST ${path}`]);
+      });
     });
   });
 });
